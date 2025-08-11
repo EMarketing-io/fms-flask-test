@@ -1,0 +1,8 @@
+Flask==3.0.0
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+gspread
+pytz
+python-dotenv
