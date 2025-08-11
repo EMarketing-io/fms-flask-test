@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+
+# Virtual environment
+.env
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files & secrets
+*.env
+config/google_service_account.json
+
+# IDE/Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit cache
+.streamlit/
+.cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Audio/Document uploads (optional: uncomment if you don’t want to commit them)
+# *.m4a
+# *.mp3
+# *.wav
+# *.docx
