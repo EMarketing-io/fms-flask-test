@@ -1,77 +1,95 @@
-import io
+import os
 import ssl
 import time
-from googleapiclient.http import MediaIoBaseUpload
+import tempfile
+from typing import Iterable
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from ssl import SSLEOFError
-from config.config import drive_service
+from config.config import get_drive_service
+
+TRANSIENT_ERRORS = (HttpError, SSLEOFError, ssl.SSLError, ConnectionError, TimeoutError)
 
 
 def _assert_folder_accessible(folder_id: str) -> None:
-    try:
-        drive_service.files().get(fileId=folder_id, fields="id, name, mimeType", supportsAllDrives=True).execute()
-    
-    except HttpError as e:
-        raise RuntimeError(
-            f"Parent folder not accessible. Check the ID '{folder_id}' "
-            f"and share permissions. If it's on a Shared Drive, add the "
-            f"service account as a member."
-        ) from e
+    svc = get_drive_service()
+    svc.files().get(
+        fileId=folder_id,
+        fields="id, name, mimeType",
+        supportsAllDrives=True,
+    ).execute()
 
 
-def upload_binary_to_drive(data: bytes, filename: str, parent_folder_id: str, retries: int = 5) -> str:
+def upload_binary_to_drive(
+    data: bytes,
+    filename: str,
+    parent_folder_id: str,
+) -> str:
+
     _assert_folder_accessible(parent_folder_id)
+    tmp = tempfile.NamedTemporaryFile(prefix="fms_", suffix="_upload", delete=False)
+    
+    try:
+        tmp.write(data)
+        tmp.flush()
+        tmp_path = tmp.name
+    finally:
+        tmp.close()
 
-    stream = io.BytesIO(data)
-    stream.seek(0)
-
-    file_metadata = {
-        "name": filename,
-        "parents": [parent_folder_id],
-    }
-
-    media = MediaIoBaseUpload(
-        stream,
-        mimetype="application/octet-stream",
-        resumable=True,
-        chunksize=5 * 1024 * 1024,
+    file_metadata = {"name": filename, "parents": [parent_folder_id]}
+    chunk_plan: Iterable[int] = (
+        256 * 1024,  
+        512 * 1024, 
+        1 * 1024 * 1024,  
+        2 * 1024 * 1024, 
+        5 * 1024 * 1024, 
     )
+    attempt = 0
 
-    for attempt in range(1, retries + 1):
+    try:
+        while True:
+            for chunksize in chunk_plan:
+                attempt += 1
+                try:
+                    media = MediaFileUpload(
+                        tmp_path,
+                        mimetype="application/octet-stream",
+                        resumable=True,
+                        chunksize=chunksize,
+                    )
+                    
+                    svc = get_drive_service()
+                    created = (
+                        svc.files()
+                        .create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields="id",
+                            supportsAllDrives=True,
+                        )
+                        .execute()
+                    )
+                    print(f"✅ Uploaded '{filename}' successfully after {attempt} attempts.")
+                    return created["id"]
+
+                except TRANSIENT_ERRORS as e:
+                    wait = min(300, 2 ** min(attempt, 8))  # max 5 min backoff
+                    print(f"⚠️ Upload failed (attempt {attempt}, chunk={chunksize}B): {e}")
+                    print(f"⏳ Retrying in {wait} seconds...")
+                    time.sleep(wait)
+                    continue
+    finally:
         try:
-            created = (
-                drive_service.files()
-                .create(
-                    body=file_metadata,
-                    media_body=media,
-                    fields="id",
-                    supportsAllDrives=True,
-                )
-                .execute()
-            )
-            return created["id"]
-        
-        except (HttpError, SSLEOFError, ssl.SSLError, ConnectionError) as e:
-            if attempt < retries:
-                wait = 2**attempt
-                print(f"⚠️ Upload failed (attempt {attempt}/{retries}): {e}")
-                print(f"⏳ Retrying in {wait} seconds...")
-                time.sleep(wait)
-                stream.seek(0)
-                
-                media = MediaIoBaseUpload(
-                    stream,
-                    mimetype="application/octet-stream",
-                    resumable=True,
-                    chunksize=5 * 1024 * 1024,
-                )
-                continue
-            raise RuntimeError(f"❌ Upload failed after {retries} attempts: {e}")
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def ensure_file_web_link(file_id: str) -> str:
+    svc = get_drive_service()
+    
     try:
-        drive_service.permissions().create(
+        svc.permissions().create(
             fileId=file_id,
             body={"type": "anyone", "role": "reader"},
             fields="id",
@@ -79,10 +97,10 @@ def ensure_file_web_link(file_id: str) -> str:
         ).execute()
     
     except HttpError:
-        pass
+        pass 
 
     meta = (
-        drive_service.files()
+        svc.files()
         .get(fileId=file_id, fields="webViewLink, webContentLink", supportsAllDrives=True)
         .execute()
     )

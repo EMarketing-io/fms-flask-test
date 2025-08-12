@@ -10,7 +10,6 @@ def get_employee_email_map(dropdown_ws) -> Dict[str, str]:
     names = dropdown_ws.col_values(1)[:30]
     emails = dropdown_ws.col_values(4)[:30]
     out: Dict[str, str] = {}
-
     for i in range(max(len(names), len(emails))):
         name = (names[i] if i < len(names) else "").strip()
         email = (emails[i] if i < len(emails) else "").strip()

@@ -1,157 +1,112 @@
 import os
 import json
 import gspread
-from typing import Optional
+import httplib2
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# ------------------------------------------------------------------------------
-# Mode detection (for Streamlit Cloud)
-# ------------------------------------------------------------------------------
-RUNNING_IN_STREAMLIT_CLOUD = False
-st = None
-try:
-    import streamlit as st  # type: ignore
-    if os.getenv("STREAMLIT_RUNTIME", "") and "OPENAI_KEY" in st.secrets:
-        RUNNING_IN_STREAMLIT_CLOUD = True
-except Exception:
-    st = None
+_client = None
+_drive_service = None
+_http = None
+_sheet = None
+_dropdown_sheet = None
 
-# ------------------------------------------------------------------------------
-# Scopes
-# ------------------------------------------------------------------------------
-GOOGLE_DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-SCOPES = GOOGLE_DRIVE_SCOPES  # alias
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
 def _looks_like_json(s: str) -> bool:
     s = (s or "").strip()
     return s.startswith("{") and s.endswith("}")
 
-def _load_creds_from_env_vars() -> Credentials:
-    """
-    Resolve credentials from either:
-      - GOOGLE_SA_FILE -> path to file (works with mounted Secret volume)
-      - GOOGLE_SA_JSON -> full JSON string in env (Secret-as-env)
-    """
-    sa_file = os.getenv("GOOGLE_SA_FILE", "").strip()
-    sa_json = os.getenv("GOOGLE_SA_JSON", "")
 
-    if sa_file and os.path.exists(sa_file):
-        return Credentials.from_service_account_file(sa_file, scopes=SCOPES)
-
-    if sa_json:
-        if not _looks_like_json(sa_json) and os.path.exists(sa_json):
-            return Credentials.from_service_account_file(sa_json, scopes=SCOPES)
-        if _looks_like_json(sa_json):
-            return Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
-
-    raise RuntimeError(
-        "Google SA credentials not found. Provide either GOOGLE_SA_JSON (secret-as-env) "
-        "or GOOGLE_SA_FILE (path to mounted secret file)."
-    )
-
-# ------------------------------------------------------------------------------
-# Load config per environment
-# ------------------------------------------------------------------------------
-if RUNNING_IN_STREAMLIT_CLOUD:
-    # Streamlit Cloud via st.secrets
-    OPENAI_KEY = st.secrets["OPENAI_KEY"]
-    OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-5-2025-08-07")
-    WHISPER_MODEL = st.secrets.get("WHISPER_MODEL", "whisper-1")
-
-    service_account_info = json.loads(st.secrets["GOOGLE_SA_JSON"])
-    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-
-    GOOGLE_SHEET_ID = st.secrets["GOOGLE_SHEET_ID"]
-    REGULAR_FOLDER_ID = st.secrets["REGULAR_FOLDER_ID"]
-    KICKSTART_FOLDER_ID = st.secrets["KICKSTART_FOLDER_ID"]
-    AUDIO_DRIVE_FOLDER_ID = st.secrets["AUDIO_DRIVE_FOLDER_ID"]
-    WEBSITE_DRIVE_FOLDER_ID = st.secrets["WEBSITE_DRIVE_FOLDER_ID"]
-    MOM_FOLDER_ID = st.secrets["MOM_FOLDER_ID"]
-    ACTION_POINT_FOLDER_ID = st.secrets["ACTION_POINT_FOLDER_ID"]
-
-    # Output (To‑Do) Sheet
-    OUTPUT_SHEET_ID = st.secrets.get("OUTPUT_SHEET_ID", "")
-    OUTPUT_SHEET_TAB = st.secrets.get("OUTPUT_SHEET_TAB", "Sheet1")
-
-else:
-    # Local / Cloud Run
+def _load_creds() -> Credentials:
     try:
-        from dotenv import load_dotenv  # type: ignore
+        from dotenv import load_dotenv
         load_dotenv()
+    
     except Exception:
         pass
 
-    OPENAI_KEY = os.getenv("OPENAI_KEY", "")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-2025-08-07")
-    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+    sa_file = os.getenv("GOOGLE_SA_FILE", "").strip()
+    sa_json = os.getenv("GOOGLE_SA_JSON", "")
 
-    GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
-    REGULAR_FOLDER_ID = os.getenv("REGULAR_FOLDER_ID", "")
-    KICKSTART_FOLDER_ID = os.getenv("KICKSTART_FOLDER_ID", "")
-    AUDIO_DRIVE_FOLDER_ID = os.getenv("AUDIO_DRIVE_FOLDER_ID", "")
-    WEBSITE_DRIVE_FOLDER_ID = os.getenv("WEBSITE_DRIVE_FOLDER_ID", "")
-    MOM_FOLDER_ID = os.getenv("MOM_FOLDER_ID", "")
-    ACTION_POINT_FOLDER_ID = os.getenv("ACTION_POINT_FOLDER_ID", "")
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
 
-    # Output (To‑Do) Sheet
-    OUTPUT_SHEET_ID = os.getenv("OUTPUT_SHEET_ID", "")
-    OUTPUT_SHEET_TAB = os.getenv("OUTPUT_SHEET_TAB", "Sheet1")
+    if sa_file and os.path.exists(sa_file):
+        return Credentials.from_service_account_file(sa_file, scopes=scopes)
 
-    # Resolve credentials (env/secret)
-    creds = _load_creds_from_env_vars()
+    if sa_json:
+        if not _looks_like_json(sa_json) and os.path.exists(sa_json):
+            return Credentials.from_service_account_file(sa_json, scopes=scopes)
+        if _looks_like_json(sa_json):
+            return Credentials.from_service_account_info(json.loads(sa_json), scopes=scopes)
 
-# Basic validation
+    raise RuntimeError(
+        "❌ Google SA credentials not found. "
+        "Set GOOGLE_SA_FILE (path) or GOOGLE_SA_JSON (inline JSON) in environment."
+    )
+
+
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+REGULAR_FOLDER_ID = os.getenv("REGULAR_FOLDER_ID", "")
+KICKSTART_FOLDER_ID = os.getenv("KICKSTART_FOLDER_ID", "")
+
 if not GOOGLE_SHEET_ID:
-    raise ValueError("GOOGLE_SHEET_ID is missing.")
+    raise ValueError("❌ GOOGLE_SHEET_ID is missing in environment.")
 
-# ------------------------------------------------------------------------------
-# Shared clients (usable by frontend & backend)
-# ------------------------------------------------------------------------------
-client = gspread.authorize(creds)
 
-sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet("Main")
-dropdown_sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet("Dropdown")
+def get_client():
+    global _client
+    if _client is None:
+        _client = gspread.authorize(_load_creds())
+    return _client
 
-# Optional Output sheet (safe to be None)
-output_sheet = None
-if OUTPUT_SHEET_ID:
+
+def get_drive_service():
+    global _drive_service, _http
+    if _drive_service is None:
+        if _http is None:
+            _http = httplib2.Http(timeout=180)
+        _drive_service = build("drive", "v3", credentials=_load_creds(), cache_discovery=False)
+    return _drive_service
+
+
+def get_sheet():
+    global _sheet
+    if _sheet is None:
+        _sheet = get_client().open_by_key(GOOGLE_SHEET_ID).worksheet("Main")
+    return _sheet
+
+
+def get_dropdown_sheet():
+    global _dropdown_sheet
+    if _dropdown_sheet is None:
+        _dropdown_sheet = (get_client().open_by_key(GOOGLE_SHEET_ID).worksheet("Dropdown"))
+    return _dropdown_sheet
+
+
+def _check_drive_folder_access(folder_id: str, name: str):
+    if not folder_id:
+        raise RuntimeError(f"❌ {name} folder ID not set in environment.")
     try:
-        output_sheet = client.open_by_key(OUTPUT_SHEET_ID).worksheet(OUTPUT_SHEET_TAB)
-    except Exception:
-        output_sheet = None  # keep running if not configured
+        svc = get_drive_service()
+        meta = (
+            svc.files()
+            .get(fileId=folder_id, fields="id, name", supportsAllDrives=True)
+            .execute()
+        )
+        print(f"✅ Drive folder '{meta['name']}' ({folder_id}) is accessible for {name}.")
+    
+    except HttpError as e:
+        raise RuntimeError(
+            f"❌ Cannot access {name} folder ID {folder_id}.\n"
+            "Make sure the service account email has at least Viewer access to the folder/shared drive.\n"
+            f"Error: {e}"
+        )
 
-drive_service = build("drive", "v3", credentials=creds)
 
-__all__ = [
-    # models/keys
-    "OPENAI_KEY",
-    "OPENAI_MODEL",
-    "WHISPER_MODEL",
-    # folder IDs / sheet
-    "GOOGLE_SHEET_ID",
-    "REGULAR_FOLDER_ID",
-    "KICKSTART_FOLDER_ID",
-    "AUDIO_DRIVE_FOLDER_ID",
-    "WEBSITE_DRIVE_FOLDER_ID",
-    "MOM_FOLDER_ID",
-    "ACTION_POINT_FOLDER_ID",
-    # output (todos) sheet
-    "OUTPUT_SHEET_ID",
-    "OUTPUT_SHEET_TAB",
-    "output_sheet",
-    # scopes / clients
-    "GOOGLE_DRIVE_SCOPES",
-    "SCOPES",
-    "creds",
-    "client",
-    "sheet",
-    "dropdown_sheet",
-    "drive_service",
-]
+_check_drive_folder_access(REGULAR_FOLDER_ID, "REGULAR")
+_check_drive_folder_access(KICKSTART_FOLDER_ID, "KICKSTART")
+print("✅ Google Drive and Google Sheets credentials verified.")
